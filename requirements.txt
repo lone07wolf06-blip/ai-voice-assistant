@@ -1,0 +1,13 @@
+openai>=1.0.0
+pyaudio
+pvporcupine
+SpeechRecognition
+playsound
+pyautogui
+pyperclip
+psutil
+requests
+python-dotenv
+pyttsx3
+sqlite3
+tkinter
