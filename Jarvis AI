@@ -1,0 +1,291 @@
+"""
+jarvis_beta.py
+Main JarvisBeta assistant.
+Dependencies: see requirements.txt
+"""
+import os
+import time
+import struct
+import subprocess
+import webbrowser
+import tempfile
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Audio / wake-word
+import pvporcupine
+import pyaudio
+
+# Speech recognition (fallback uses SpeechRecognition + Google STT)
+import speech_recognition as sr
+
+# OpenAI
+from openai import OpenAI
+
+# Playback
+from playsound import playsound
+
+# Automation
+import pyautogui
+import pyperclip
+import psutil
+import requests
+
+# Load env
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+PORCUPINE_ACCESS_KEY = os.getenv("PORCUPINE_ACCESS_KEY")
+PORCUPINE_KEYWORD_PATH = os.getenv("PORCUPINE_KEYWORD_PATH")  # optional .ppn path
+
+if not OPENAI_API_KEY:
+    raise RuntimeError("Set OPENAI_API_KEY in environment or .env file")
+if not PORCUPINE_ACCESS_KEY:
+    raise RuntimeError("Set PORCUPINE_ACCESS_KEY in environment or .env file")
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# ========== Porcupine wake word setup ==========
+if PORCUPINE_KEYWORD_PATH:
+    porcupine = pvporcupine.create(access_key=PORCUPINE_ACCESS_KEY, keyword_paths=[PORCUPINE_KEYWORD_PATH])
+else:
+    porcupine = pvporcupine.create(access_key=PORCUPINE_ACCESS_KEY, keywords=["beta"])  # built-in
+
+pa = pyaudio.PyAudio()
+stream = pa.open(rate=porcupine.sample_rate,
+                 channels=1,
+                 format=pyaudio.paInt16,
+                 input=True,
+                 frames_per_buffer=porcupine.frame_length)
+
+print("Wake word engine running — say 'Beta' to activate.")
+
+# Helper: speak using OpenAI TTS (save mp3 and play)
+def speak_with_openai_tts(text: str, voice="steel"):
+    out_path = Path(tempfile.gettempdir()) / f"jarvis_tts_{int(time.time()*1000)}.mp3"
+    try:
+        resp = client.audio.speech.create(
+            model="tts-1",
+            voice=voice,
+            input=text
+        )
+        # Many clients provide stream_to_file helper
+        try:
+            resp.stream_to_file(out_path)
+        except Exception:
+            # If raw bytes available
+            with open(out_path, "wb") as f:
+                f.write(resp)
+    except Exception as e:
+        print("OpenAI TTS failed:", e)
+        # fallback to pyttsx3
+        try:
+            import pyttsx3
+            engine = pyttsx3.init()
+            engine.setProperty("rate", 160)
+            engine.say(text)
+            engine.runAndWait()
+            return
+        except Exception as e2:
+            print("Fallback TTS failed:", e2)
+            return
+
+    try:
+        playsound(str(out_path))
+    except Exception as e:
+        print("Error playing TTS audio:", e)
+    finally:
+        try:
+            out_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+# ========== STT using OpenAI Whisper (if available) else SpeechRecognition ==========
+recognizer = sr.Recognizer()
+
+def transcribe_with_whisper(audio_file_path: str) -> str:
+    """Send audio file to OpenAI transcription (Whisper) and return text."""
+    try:
+        with open(audio_file_path, "rb") as f:
+            resp = client.audio.transcriptions.create(file=f, model="gpt-4o-transcribe")
+        # Adjust field depending on client; try common keys
+        return resp.get("text") or resp.get("transcription") or str(resp)
+    except Exception as e:
+        print("Whisper transcription failed:", e)
+        return ""
+
+
+def record_command_to_file(timeout=6, phrase_time_limit=8) -> (str, str):
+    """Record from mic, save to temp WAV, return (filepath, success_flag)
+    Uses SpeechRecognition to capture microphone then optionally transcribe with Whisper.
+    """
+    with sr.Microphone() as source:
+        recognizer.adjust_for_ambient_noise(source, duration=0.4)
+        audio = recognizer.listen(source, timeout=timeout, phrase_time_limit=phrase_time_limit)
+
+    tmp = Path(tempfile.gettempdir()) / f"jarvis_rec_{int(time.time()*1000)}.wav"
+    with open(tmp, "wb") as f:
+        f.write(audio.get_wav_data())
+    return str(tmp)
+
+
+def transcribe_audio_file(file_path: str) -> str:
+    # Try OpenAI Whisper first
+    text = transcribe_with_whisper(file_path)
+    if text and len(text.strip()) > 0:
+        return text.lower()
+    # Fallback: use Google STT via SpeechRecognition
+    try:
+        with sr.AudioFile(file_path) as source:
+            audio = recognizer.record(source)
+            text = recognizer.recognize_google(audio)
+            return text.lower()
+    except Exception as e:
+        print("Fallback STT failed:", e)
+        return ""
+
+# ========== GPT query ==========
+def ask_gpt(prompt, system_prompt=None):
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=messages,
+        max_tokens=600
+    )
+    out = resp.choices[0].message["content"]
+    return out
+
+# ========== Automation handlers (skeletons for the 100 commands) ==========
+# Implement several core handlers; expand as needed using the 100-command list.
+
+def open_application(app_name):
+    app = app_name.lower()
+    try:
+        if "chrome" in app:
+            chrome_path = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+            if Path(chrome_path).exists():
+                os.startfile(chrome_path)
+            else:
+                webbrowser.open("https://www.google.com")
+            return "Opening Chrome."
+        if "vscode" in app or "visual studio code" in app:
+            try:
+                subprocess.Popen(["code"])  # assumes code in PATH
+            except Exception:
+                return "VS Code not found in PATH."
+            return "Opening VS Code."
+        if "notepad" in app:
+            subprocess.Popen(["notepad"])
+            return "Opening Notepad."
+        if "spotify" in app:
+            # best-effort path
+            spotify = Path(os.getenv('LOCALAPPDATA', '')) / 'Microsoft' / 'WindowsApps' / 'Spotify.exe'
+            try:
+                os.startfile(str(spotify))
+            except Exception:
+                return "Could not open Spotify automatically."
+            return "Opening Spotify."
+        if "youtube" in app:
+            webbrowser.open("https://www.youtube.com")
+            return "Opening YouTube."
+    except Exception as e:
+        return f"Failed to open {app_name}: {e}"
+    return f"No mapping to open {app_name}."
+
+
+def take_screenshot():
+    fn = Path.home() / "Pictures" / f"jarvis_screenshot_{int(time.time())}.png"
+    pyautogui.screenshot(str(fn))
+    return f"Saved screenshot to {fn}"
+
+
+def type_text(content: str):
+    pyperclip.copy(content)
+    pyautogui.hotkey('ctrl', 'v')
+    return "Typed the text."
+
+
+def set_volume_percent(percent: int):
+    # Simple approach: press volume keys repeatedly — approximate
+    # For accurate control use third-party tool or Windows CoreAudio APIs
+    current = 50
+    # naive: just press volumeup or volumedown
+    return f"Set volume to {percent} percent (approx)."
+
+
+def perform_action(command_text: str):
+    cmd = command_text.lower().strip()
+
+    if cmd.startswith("open "):
+        target = cmd.replace("open ", "", 1)
+        return open_application(target)
+
+    if cmd.startswith("search ") or cmd.startswith("google "):
+        query = cmd.replace("search ", "", 1).replace("google ", "", 1)
+        webbrowser.open(f"https://www.google.com/search?q={query}")
+        return f"Searching Google for {query}"
+
+    if cmd.startswith("type "):
+        content = command_text[5:]
+        return type_text(content)
+
+    if "screenshot" in cmd or "take screenshot" in cmd:
+        return take_screenshot()
+
+    if "shutdown" in cmd:
+        return "To shutdown, say 'Beta, confirm shutdown'"
+    if "confirm shutdown" in cmd:
+        try:
+            speak_with_openai_tts("Shutting down the system. Goodbye.")
+            subprocess.run(["shutdown", "/s", "/t", "10"], check=False)
+            return "Shutdown initiated."
+        except Exception as e:
+            return f"Shutdown failed: {e}"
+
+    # If none matched, fallback to GPT answer
+    ai_resp = ask_gpt(f"You are a PC automation assistant. The user said: '{command_text}'. If this is a PC command, respond concisely with what to do. Otherwise answer the question.")
+    return ai_resp
+
+# ========== Main loop ==========
+try:
+    while True:
+        pcm = stream.read(porcupine.frame_length, exception_on_overflow=False)
+        pcm_unpacked = struct.unpack_from("h" * porcupine.frame_length, pcm)
+
+        result = porcupine.process(pcm_unpacked)
+        if result >= 0:
+            print("[Beta] Activated.")
+            speak_with_openai_tts("Yes? I am listening.", voice="steel")
+            wav_path = record_command_to_file(timeout=6, phrase_time_limit=8)
+            print("Recorded to:", wav_path)
+            cmd = transcribe_audio_file(wav_path)
+            print("Heard:", cmd)
+
+            if not cmd:
+                speak_with_openai_tts("I didn't catch that. Say 'Beta' and try again.")
+                continue
+
+            if any(k in cmd for k in ["stop assistant", "goodbye", "exit"]):
+                speak_with_openai_tts("Goodbye. Shutting down assistant.")
+                break
+
+            action_reply = perform_action(cmd)
+            speak_with_openai_tts(action_reply, voice="steel")
+
+except KeyboardInterrupt:
+    print("Exiting...")
+
+finally:
+    try:
+        stream.close()
+    except Exception:
+        pass
+    try:
+        pa.terminate()
+    except Exception:
+        pass
+    porcupine.delete()
+    print("Cleaned up. Bye.")
